@@ -70,14 +70,10 @@ class SQLiteRepository:
         }
 
     def create_entity(self, entity_id, kind, status, data, actor_id):
-        now = utcnow()
-        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
-                (entity_id, kind, status, payload, actor_id, now, now),
-            )
+        self.apply_unit_of_work(
+            creates=[{"id": entity_id, "kind": kind, "status": status,
+                      "data": data, "actor_id": actor_id}]
+        )
         return self.get_entity(entity_id)
 
     def get_entity(self, entity_id):
@@ -111,51 +107,109 @@ class SQLiteRepository:
         ]
 
     def update_entity(self, entity_id, expected_version, status, data):
+        self.apply_unit_of_work(
+            updates=[{"id": entity_id, "expected_version": expected_version,
+                      "status": status, "data": data}]
+        )
+        return self.get_entity(entity_id)
+
+    def apply_unit_of_work(self, creates=(), updates=(), guards=(), audits=(), idempotency=()):
+        """Commit entity creates, optimistic-lock updates, state guards, audit
+        entries and idempotency records in a single SQLite transaction.
+
+        BEGIN IMMEDIATE serializes writers: a guard or version mismatch raises
+        ConflictError and rolls the whole unit back, so concurrent operations
+        cannot produce torn state (e.g. consent activation vs authorization
+        revocation: only one can succeed).
+        """
         now = utcnow()
-        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT version FROM entities WHERE id = ?", (entity_id,)
-            ).fetchone()
-            if not row:
-                raise NotFoundError("entity not found: " + entity_id)
-            current_version = int(row["version"])
-            if expected_version is not None and current_version != int(expected_version):
-                raise ConflictError(
-                    "version conflict: expected %s, found %s"
-                    % (expected_version, current_version)
+            for item in creates:
+                payload = json.dumps(item["data"], ensure_ascii=False, sort_keys=True)
+                connection.execute(
+                    "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                    (item["id"], item["kind"], item["status"], payload,
+                     item["actor_id"], now, now),
                 )
-            connection.execute(
-                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
-                "WHERE id = ? AND version = ?",
-                (status, payload, now, entity_id, current_version),
-            )
+            for guard in guards:
+                row = connection.execute(
+                    "SELECT version, status FROM entities WHERE id = ?",
+                    (guard["id"],),
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + str(guard["id"]))
+                expected = guard.get("expected_version")
+                if expected is not None and int(row["version"]) != int(expected):
+                    raise ConflictError(
+                        "version conflict on %s: expected %s, found %s"
+                        % (guard["id"], expected, row["version"])
+                    )
+                required_status = guard.get("required_status")
+                if required_status is not None and row["status"] != required_status:
+                    raise ConflictError(
+                        "status conflict on %s: expected %s, found %s"
+                        % (guard["id"], required_status, row["status"])
+                    )
+            for item in updates:
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?", (item["id"],)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + str(item["id"]))
+                current_version = int(row["version"])
+                expected = item.get("expected_version")
+                if expected is not None and current_version != int(expected):
+                    raise ConflictError(
+                        "version conflict: expected %s, found %s"
+                        % (expected, current_version)
+                    )
+                payload = json.dumps(item["data"], ensure_ascii=False, sort_keys=True)
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (item["status"], payload, now, item["id"], current_version),
+                )
+            for entry in audits:
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entry["entity_id"],
+                        entry["actor_id"],
+                        entry["actor_role"],
+                        entry["action"],
+                        entry["from_status"],
+                        entry["to_status"],
+                        json.dumps(entry.get("detail") or {}, ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+            for item in idempotency:
+                connection.execute(
+                    "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (item["actor_id"], item["key"], item["entity_id"], now),
+                )
             connection.commit()
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise ConflictError(str(exc))
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
-        return self.get_entity(entity_id)
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    entity_id,
-                    actor_id,
-                    actor_role,
-                    action,
-                    from_status,
-                    to_status,
-                    json.dumps(detail, ensure_ascii=False, sort_keys=True),
-                    utcnow(),
-                ),
-            )
+        self.apply_unit_of_work(
+            audits=[{"entity_id": entity_id, "actor_id": actor_id,
+                     "actor_role": actor_role, "action": action,
+                     "from_status": from_status, "to_status": to_status,
+                     "detail": detail}]
+        )
 
     def list_audit(self, entity_id=None):
         with self._connect() as connection:
@@ -189,12 +243,9 @@ class SQLiteRepository:
         return row["entity_id"] if row else None
 
     def save_idempotency(self, actor_id, idem_key, entity_id):
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (actor_id, idem_key, entity_id, utcnow()),
-            )
+        self.apply_unit_of_work(
+            idempotency=[{"actor_id": actor_id, "key": idem_key, "entity_id": entity_id}]
+        )
 
     def ping(self):
         with self._connect() as connection:

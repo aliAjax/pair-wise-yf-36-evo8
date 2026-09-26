@@ -24,7 +24,17 @@ python3 app.py --db ./data.db --port 8302
 
 ## 核心对象
 
-- `participant`：参与者；`consent`：同意版本；`sample`：样本；`withdrawal`：撤回申请。
+- `participant`：参与者；`consent`：同意版本；`sample`：样本；`withdrawal`：撤回申请；`authorization`：代理授权。
+
+## 代理授权
+
+家属等代理人代签同意前必须先登记正式授权：
+
+- `POST /api/authorizations`：登记`participant_id`、`agent_name`（代理人）、`relationship`（关系）、`purposes`（可办理用途列表）、`expires_at`（截止日，ISO日期，不得早于当天）。登记后状态为`active`。
+- 代理人提交同意时在`consent`上携带`authorization_id`。创建和激活时系统都会核对：授权存在且为`active`、未过截止日、参与者一致、同意范围不超出授权用途。任一不符即退回，响应体`error`字段给出具体原因。
+- `POST /api/entities/<id>/actions`，`action=revoke`：参与者撤销授权。同一事务内该授权下尚未生效（`draft`）的同意被置为`stopped`；已生效同意和已入库样本保持原结论不变。
+- 撤销与同意激活并发时只允许一个成功：两者在同一`BEGIN IMMEDIATE`事务内通过乐观锁与状态守卫互斥，失败方收到`409`冲突，可重试。
+- 授权状态、同意状态和审计记录在同一事务提交，任一失败整体回滚。
 
 ## 主要接口
 
