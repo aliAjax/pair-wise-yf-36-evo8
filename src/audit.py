@@ -9,8 +9,9 @@ class AuditTrail:
     def __init__(self, repository):
         self.repository = repository
 
-    def record(self, entity_id, actor, action, from_status, to_status, detail=None):
-        self.repository.append_audit(
+    def record(self, tx, entity_id, actor, action, from_status, to_status, detail=None):
+        """Append an audit row inside the caller's open transaction."""
+        tx.append_audit(
             entity_id=entity_id,
             actor_id=actor.user_id,
             actor_role=actor.role,

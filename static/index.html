@@ -23,6 +23,13 @@ GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
 POST /api/entities/&lt;id&gt;/actions</pre>
+  <h2>正式代理授权</h2>
+  <pre>POST /api/authorizations
+  {"participant_id":"...","agent_user_id":"...","relationship":"...",
+   "allowed_purposes":["research"],"expires_at":"2030-01-01"}
+POST /api/entities/&lt;authorization_id&gt;/actions
+  {"action":"revoke","data":{"reason":"..."}}</pre>
+  <p>代理人提交同意时在 <code>consent</code> 中携带 <code>authorization_id</code>；范围或截止日不符会被退回。撤销时未生效的同意停止，已生效同意和已入库样本保持原结论。</p>
 </main>
 <script>
 async function checkHealth() {

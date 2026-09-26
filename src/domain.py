@@ -33,6 +33,8 @@ class Role(str, Enum):
     researcher = "researcher"
     biobank = "biobank"
     committee = "committee"
+    participant = "participant"
+    agent = "agent"
 
 
 @dataclass
